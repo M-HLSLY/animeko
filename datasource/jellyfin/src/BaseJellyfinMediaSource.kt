@@ -16,34 +16,14 @@ import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.http.HttpHeaders
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.flow.asFlow
-import kotlinx.coroutines.flow.emptyFlow
-import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.flatMapConcat
-import kotlinx.coroutines.flow.flatMapMerge
-import kotlinx.coroutines.flow.flowOf
-import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.flow.*
 import kotlinx.serialization.Serializable
-import me.him188.ani.datasources.api.DefaultMedia
-import me.him188.ani.datasources.api.EpisodeSort
-import me.him188.ani.datasources.api.MediaExtraFiles
-import me.him188.ani.datasources.api.MediaProperties
-import me.him188.ani.datasources.api.Subtitle
-import me.him188.ani.datasources.api.SubtitleKind
-import me.him188.ani.datasources.api.paging.SinglePagePagedSource
-import me.him188.ani.datasources.api.paging.SizedSource
-import me.him188.ani.datasources.api.source.ConnectionStatus
-import me.him188.ani.datasources.api.source.HttpMediaSource
-import me.him188.ani.datasources.api.source.MatchKind
-import me.him188.ani.datasources.api.source.MediaFetchRequest
-import me.him188.ani.datasources.api.source.MediaMatch
-import me.him188.ani.datasources.api.source.MediaSourceKind
-import me.him188.ani.datasources.api.source.MediaSourceLocation
-import me.him188.ani.datasources.api.source.matches
-import me.him188.ani.datasources.api.topic.EpisodeRange
+import me.him188.ani.datasources.api.*
+import me.him188.ani.datasources.api.source.*
 import me.him188.ani.datasources.api.topic.FileSize
 import me.him188.ani.datasources.api.topic.ResourceLocation
 import me.him188.ani.utils.ktor.ScopedHttpClient
+import java.util.concurrent.ConcurrentHashMap
 
 abstract class BaseJellyfinMediaSource(
     private val client: ScopedHttpClient,
@@ -52,9 +32,25 @@ abstract class BaseJellyfinMediaSource(
     abstract val userId: String
     abstract val apiKey: String
 
+    // 缓存数据结构
+    private val seriesCache = ConcurrentHashMap<String, List<Item>>()
+    private val seasonCache = ConcurrentHashMap<String, List<Item>>()
+    private val episodeCache = ConcurrentHashMap<String, List<Item>>()
+
+    init {
+        // 注册应用退出时的缓存清理（需框架支持）
+        ApplicationLifecycle.addOnExitListener { clearCache() }
+    }
+
+    fun clearCache() {
+        seriesCache.clear()
+        seasonCache.clear()
+        episodeCache.clear()
+    }
+
     override suspend fun checkConnection(): ConnectionStatus {
         try {
-            doSearch("AA测试BB")
+            doSearchSeries("AA测试BB")
             return ConnectionStatus.SUCCESS
         } catch (e: CancellationException) {
             throw e
@@ -65,24 +61,42 @@ abstract class BaseJellyfinMediaSource(
 
     override suspend fun fetch(query: MediaFetchRequest): SizedSource<MediaMatch> {
         return SinglePagePagedSource {
-            query.subjectNames
-                .asFlow()
+            query.subjectNames.asFlow()
                 .flatMapConcat { subjectName ->
-                    val resp = doSearch(subjectName)
-                    resp.Items.asFlow()
+                    val seriesList = getCachedOrFetch(subjectName, seriesCache) {
+                        doSearchSeries(subjectName).Items
+                    }.filter { it.Name.contains(subjectName, ignoreCase = true) }
+
+                    seriesList.asFlow()
+                        .flatMapConcat { series ->
+                            val seasons = getCachedOrFetch(series.Id, seasonCache) {
+                                doSeasons(series.Id).Items
+                            }.filter { it.Name.contains(subjectName, ignoreCase = true) }
+
+                            if (seasons.isEmpty()) {
+                                getCachedOrFetch(series.Id, episodeCache) {
+                                    doEpisodes(series.Id).Items
+                                }.asFlow()
+                            } else {
+                                seasons.asFlow()
+                                    .flatMapConcat { season ->
+                                        getCachedOrFetch(season.Id, episodeCache) {
+                                            doEpisodes(season.Id).Items
+                                        }.asFlow()
+                                            .filter { episode ->
+                                                episode.Name.contains(subjectName, ignoreCase = true)
+                                            }
+                                    }
+                            }
+                        }
                 }
-                .flatMapMerge {
-                    when (it.Type) {
-                        "Season" -> doSearch(parentId = it.Id).Items.asFlow()
-                        "Episode" -> flowOf(it)
-                        "Movie" -> flowOf(it)
-                        else -> emptyFlow()
-                    }
-                }
-                .filter { (it.Type == "Episode" || it.Type == "Movie") && it.CanDownload }
+                .filter { it.Type == "Episode" && it.CanDownload }
                 .toList()
-                .distinctBy { it.Id }
                 .mapNotNull { item ->
+                    val playbackInfo = getPlaybackInfo(item.Id)
+                    val mediaSource = playbackInfo.MediaSources.firstOrNull()
+                    val (resolution, languages) = parseMediaSourceName(mediaSource?.Name ?: "")
+
                     val (originalTitle, episodeRange) = when (item.Type) {
                         "Episode" -> {
                             val indexNumber = item.IndexNumber ?: return@mapNotNull null
@@ -91,12 +105,7 @@ abstract class BaseJellyfinMediaSource(
                                 EpisodeRange.single(EpisodeSort(indexNumber)),
                             )
                         }
-
-                        "Movie" -> Pair(
-                            item.Name,
-                            EpisodeRange.unknownSeason(),
-                        )
-
+                        "Movie" -> Pair(item.Name, EpisodeRange.unknownSeason())
                         else -> return@mapNotNull null
                     }
 
@@ -106,15 +115,15 @@ abstract class BaseJellyfinMediaSource(
                             mediaSourceId = mediaSourceId,
                             originalUrl = "$baseUrl/Items/${item.Id}",
                             download = ResourceLocation.HttpStreamingFile(
-                                uri = getDownloadUri(item.Id),
+                                uri = mediaSource?.Path ?: getDownloadUri(item.Id),
                             ),
                             originalTitle = originalTitle,
                             publishedTime = 0,
                             properties = MediaProperties(
                                 subjectName = item.SeasonName,
                                 episodeName = item.Name,
-                                subtitleLanguageIds = listOf("CHS"),
-                                resolution = "1080P",
+                                subtitleLanguageIds = languages.ifEmpty { listOf("CHS") },
+                                resolution = resolution ?: "1080P",
                                 alliance = mediaSourceId,
                                 size = FileSize.Unspecified,
                                 subtitleKind = SubtitleKind.EXTERNAL_PROVIDED,
@@ -134,7 +143,20 @@ abstract class BaseJellyfinMediaSource(
         }
     }
 
-    protected abstract fun getDownloadUri(itemId: String): String
+    // 解析 MediaSource.Name 提取画质和语言
+    private fun parseMediaSourceName(name: String): Pair<String?, List<String>> {
+        val resolutionRegex = """(\d{3,4}[PpKk])""".toRegex()
+        val languageRegex = """\[([A-Z]{2,3})\]""".toRegex()
+        val resolution = resolutionRegex.find(name)?.value?.uppercase()
+        val languages = languageRegex.findAll(name).map { it.groupValues[1] }.toList()
+        return Pair(resolution, languages)
+    }
+
+    private suspend fun getCachedOrFetch(
+        key: String,
+        cache: ConcurrentHashMap<String, List<Item>>,
+        fetch: suspend () -> List<Item>
+    ): List<Item> = cache[key] ?: fetch().also { cache[key] = it }
 
     private fun getSubtitles(itemId: String, mediaStreams: List<MediaStream>): List<Subtitle> {
         return mediaStreams
@@ -145,7 +167,7 @@ abstract class BaseJellyfinMediaSource(
                     language = stream.Language,
                     mimeType = when (stream.Codec.lowercase()) {
                         "ass" -> "text/x-ass"
-                        else -> "application/octet-stream"  // 默认二进制流
+                        else -> "application/octet-stream"
                     },
                     label = stream.Title,
                 )
@@ -156,59 +178,75 @@ abstract class BaseJellyfinMediaSource(
         return "$baseUrl/Videos/$itemId/$itemId/Subtitles/$index/0/Stream.$codec"
     }
 
-
-    private suspend fun doSearch(
-        subjectName: String? = null,
-        recursive: Boolean = true,
-        parentId: String? = null,
-    ) = client.use {
+    private suspend fun doSearchSeries(subjectName: String) = client.use {
         get("$baseUrl/Items") {
-            configureAuthorizationHeaders()
-            parameter("userId", userId)
-            parameter("enableImages", false)
-            parameter("recursive", recursive)
             parameter("searchTerm", subjectName)
-            parameter("fields", "CanDownload")
-            parameter("fields", "MediaStreams")
-            parameter("parentId", parentId)
+            parameter("includeItemTypes", "Series")
+            parameter("fields", "CanDownload,ParentId,MediaSources")
+            parameter("enableImages", true)
+            configureAuthorizationHeaders()
         }.body<SearchResponse>()
     }
 
-    private fun HttpRequestBuilder.configureAuthorizationHeaders() {
-        header(
-            HttpHeaders.Authorization,
-            "MediaBrowser Token=\"$apiKey\"",
-        )
+    private suspend fun doSeasons(seriesId: String) = client.use {
+        get("$baseUrl/Items") {
+            parameter("parentId", seriesId)
+            parameter("includeItemTypes", "Season")
+            parameter("enableImages", true)
+            configureAuthorizationHeaders()
+        }.body<SearchResponse>()
     }
+
+    private suspend fun doEpisodes(seasonId: String) = client.use {
+        get("$baseUrl/Items") {
+            parameter("parentId", seasonId)
+            parameter("includeItemTypes", "Episode")
+            parameter("fields", "MediaSources")
+            parameter("enableImages", true)
+            configureAuthorizationHeaders()
+        }.body<SearchResponse>()
+    }
+
+    private suspend fun getPlaybackInfo(itemId: String) = client.use {
+        get("$baseUrl/Items/$itemId/PlaybackInfo") {
+            configureAuthorizationHeaders()
+        }.body<PlaybackInfoResponse>()
+    }
+
+    private fun HttpRequestBuilder.configureAuthorizationHeaders() {
+        header(HttpHeaders.Authorization, "MediaBrowser Token=\"$apiKey\"")
+    }
+
+    @Serializable
+    private data class PlaybackInfoResponse(val MediaSources: List<MediaSourceInfo>)
+
+    @Serializable
+    private data class MediaSourceInfo(val Id: String, val Name: String, val Path: String)
+
+    @Serializable
+    private class SearchResponse(val Items: List<Item> = emptyList())
+
+    @Serializable
+    @Suppress("PropertyName")
+    private data class MediaStream(
+        val Title: String? = null,
+        val Language: String? = null,
+        val Type: String,
+        val Codec: String,
+        val Index: Int,
+        val IsExternal: Boolean,
+        val IsTextSubtitleStream: Boolean,
+    )
+
+    @Serializable
+    @Suppress("PropertyName")
+    private data class Item(
+        val Name: String,
+        val SeasonName: String? = null,
+        val Id: String,
+        val IndexNumber: Int? = null,
+        val Type: String,
+        val CanDownload: Boolean = false,
+        val MediaStreams: List<MediaStream> = emptyList(),
+    )
 }
-
-@Serializable
-private class SearchResponse(
-    val Items: List<Item> = emptyList(),
-)
-
-@Serializable
-@Suppress("PropertyName")
-private data class MediaStream(
-    val Title: String? = null, // 除了字幕以外其他可能没有
-    val Language: String? = null, // 字幕语言代码，如 chs
-    val Type: String,
-    val Codec: String,
-    val Index: Int,
-    val IsExternal: Boolean, // 是否为外挂字幕
-    val IsTextSubtitleStream: Boolean,
-)
-
-@Serializable
-@Suppress("PropertyName")
-private data class Item(
-    val Name: String,
-    val SeasonName: String? = null,
-    val Id: String,
-    val OriginalTitle: String? = null, // 日文
-    val IndexNumber: Int? = null,
-    val ParentIndexNumber: Int? = null,
-    val Type: String, // "Episode", "Series", ...
-    val CanDownload: Boolean = false,
-    val MediaStreams: List<MediaStream> = emptyList(),
-)
