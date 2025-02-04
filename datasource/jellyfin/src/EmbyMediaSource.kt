@@ -9,16 +9,11 @@
 
 package me.him188.ani.datasources.jellyfin
 
-import me.him188.ani.datasources.api.source.FactoryId
-import me.him188.ani.datasources.api.source.MediaSource
-import me.him188.ani.datasources.api.source.MediaSourceConfig
-import me.him188.ani.datasources.api.source.MediaSourceFactory
-import me.him188.ani.datasources.api.source.MediaSourceInfo
-import me.him188.ani.datasources.api.source.MediaSourceKind
-import me.him188.ani.datasources.api.source.get
+import me.him188.ani.datasources.api.source.*
 import me.him188.ani.datasources.api.source.parameter.MediaSourceParameters
 import me.him188.ani.datasources.api.source.parameter.MediaSourceParametersBuilder
 import me.him188.ani.utils.ktor.ScopedHttpClient
+import java.util.concurrent.ConcurrentHashMap
 
 class EmbyMediaSource(
     config: MediaSourceConfig,
@@ -51,8 +46,7 @@ class EmbyMediaSource(
     }
 
     class Factory : MediaSourceFactory {
-        override val factoryId: FactoryId get() = me.him188.ani.datasources.api.source.FactoryId(ID)
-
+        override val factoryId: FactoryId get() = FactoryId(ID)
         override val parameters: MediaSourceParameters = Parameters.build()
         override val info: MediaSourceInfo get() = INFO
         override val allowMultipleInstances: Boolean get() = true
@@ -71,6 +65,6 @@ class EmbyMediaSource(
     override val apiKey = config[Parameters.apikey]
 
     override fun getDownloadUri(itemId: String): String {
-        return "$baseUrl/Items/$itemId/Download?api_key=$apiKey"
+        return "$baseUrl/Videos/$itemId/stream?api_key=$apiKey"
     }
 }
