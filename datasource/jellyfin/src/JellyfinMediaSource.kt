@@ -9,19 +9,15 @@
 
 package me.him188.ani.datasources.jellyfin
 
-import me.him188.ani.datasources.api.source.FactoryId
-import me.him188.ani.datasources.api.source.MediaSource
-import me.him188.ani.datasources.api.source.MediaSourceConfig
-import me.him188.ani.datasources.api.source.MediaSourceFactory
-import me.him188.ani.datasources.api.source.MediaSourceInfo
-import me.him188.ani.datasources.api.source.MediaSourceKind
-import me.him188.ani.datasources.api.source.get
+import me.him188.ani.datasources.api.source.*
 import me.him188.ani.datasources.api.source.parameter.MediaSourceParameters
 import me.him188.ani.datasources.api.source.parameter.MediaSourceParametersBuilder
 import me.him188.ani.utils.ktor.ScopedHttpClient
 
-class JellyfinMediaSource(config: MediaSourceConfig, client: ScopedHttpClient) :
-    BaseJellyfinMediaSource(client) {
+class JellyfinMediaSource(
+    config: MediaSourceConfig,
+    client: ScopedHttpClient,
+) : BaseJellyfinMediaSource(client) {
     companion object {
         const val ID = "jellyfin"
         val INFO = MediaSourceInfo(
@@ -50,7 +46,6 @@ class JellyfinMediaSource(config: MediaSourceConfig, client: ScopedHttpClient) :
 
     class Factory : MediaSourceFactory {
         override val factoryId: FactoryId get() = FactoryId(ID)
-
         override val parameters: MediaSourceParameters = Parameters.build()
         override val info: MediaSourceInfo get() = INFO
         override val allowMultipleInstances: Boolean get() = true
@@ -62,13 +57,14 @@ class JellyfinMediaSource(config: MediaSourceConfig, client: ScopedHttpClient) :
     }
 
     override val kind: MediaSourceKind get() = MediaSourceKind.WEB
-    override val info: MediaSourceInfo = INFO
+    override val info: MediaSourceInfo get() = INFO
     override val mediaSourceId: String get() = ID
     override val baseUrl = config[Parameters.baseUrl].removeSuffix("/")
     override val userId = config[Parameters.userId]
     override val apiKey = config[Parameters.apikey]
 
     override fun getDownloadUri(itemId: String): String {
+        // Jellyfin 官方下载路径（根据文档确认）
         return "$baseUrl/Items/$itemId/Download?ApiKey=$apiKey"
     }
 }
